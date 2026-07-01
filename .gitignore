@@ -1,0 +1,31 @@
+# Media files (often sensitive recordings)
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.ogg
+*.aac
+*.wma
+*.mp4
+*.flv
+*.webm
+*.mkv
+*.mov
+*.avi
+*.wmv
+*.m4v
+*.ts
+
+# Per-run output folders: <audio_name>-<uuid>/
+*-????????-????-????-????-????????????/
+
+# Local state / logs
+.processed.json
+cleanup.log
+*.log
+
+# Editor / local config / secrets
+.idea/
+.mcp.json
+__pycache__/
+*.pyc
