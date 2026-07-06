@@ -39,6 +39,28 @@ have prebuilt wheels for them.
 Whisper decodes audio via `ffmpeg`, and this script also uses it to pull the audio track out of video files. Install
 `ffmpeg` and make sure it's on your `PATH` before running anything (`ffmpeg -version` should work from a terminal).
 
+- Windows: `choco install ffmpeg` (Chocolatey) or download a build from https://ffmpeg.org/download.html and add it to
+  `PATH`.
+- macOS: `brew install ffmpeg`.
+- Linux: `sudo apt install ffmpeg` (Debian/Ubuntu) or your distro's equivalent.
+
+### Installing dependencies (cross-platform)
+
+```
+pip install -r requirements.txt
+```
+
+This installs everything on Windows, macOS, and Linux, including a CPU/MPS build of `torch`. If you're on **Windows or
+Linux with an NVIDIA GPU** and want CUDA-accelerated transcription/diarization, follow up with:
+
+```
+pip install -r requirements-cuda.txt
+```
+
+which reinstalls `torch`/`torchaudio`/`torchvision` as CUDA 12.4 builds (requires a matching NVIDIA driver). This step
+doesn't apply to macOS — there's no CUDA support there, so the plain `requirements.txt` install is all you need (the
+script falls back to CPU automatically either way, per `torch.cuda.is_available()`).
+
 ### Hugging Face token (for diarization)
 
 Speaker diarization uses a gated pyannote model, so you'll need a Hugging Face account and token:
@@ -46,12 +68,13 @@ Speaker diarization uses a gated pyannote model, so you'll need a Hugging Face a
 1. Create a token at https://huggingface.co/settings/tokens (read access is enough).
 2. Accept the model terms for `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0` on huggingface.co —
    diarization will fail to load without this.
-3. Set the token as an environment variable rather than hardcoding it in the script:
+3. Set the token, either via a `.env` file or an environment variable — never hardcode it in the script:
+    - `.env` file (recommended): copy `.env.example` to `.env` and fill in your token. The script loads it automatically
+      on startup. `.env` is gitignored, so it stays local.
     - PowerShell: `$env:HUGGINGFACE_TOKEN = "hf_..."`
     - Bash: `export HUGGINGFACE_TOKEN="hf_..."`
 
-   (`HF_TOKEN` and `HUGGING_FACE_TOKEN` also work.) The script does have a `HUGGINGFACE_TOKEN` variable near the top if
-   you'd rather paste it there for local-only use, but **never commit a real token** — it's a live credential.
+   (`HF_TOKEN` and `HUGGING_FACE_TOKEN` also work.) **Never commit a real token** — it's a live credential.
 
 If no valid token is found, or `ENABLE_DIARIZATION = False`, the script still runs and produces a plain transcript, just
 without speaker labels.

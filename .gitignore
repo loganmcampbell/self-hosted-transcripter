@@ -19,6 +19,9 @@
 # Per-run output folders: <audio_name>-<uuid>/
 *-????????-????-????-????-????????????/
 
+# Archived (pending-deletion) run folders, grouped by ISO week
+archive/
+
 # Local state / logs
 .processed.json
 cleanup.log
@@ -27,5 +30,6 @@ cleanup.log
 # Editor / local config / secrets
 .idea/
 .mcp.json
+.env
 __pycache__/
 *.pyc

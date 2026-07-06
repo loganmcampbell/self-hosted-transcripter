@@ -19,7 +19,7 @@ Deps:
   pip install git+https://github.com/openai/whisper.git
   pip install pyannote.audio==3.* typing_extensions
 Env:
-  set HUGGINGFACE_TOKEN (required for diarization)
+  HUGGINGFACE_TOKEN (required for diarization) — set via a local .env file (see .env.example) or an env var
 """
 
 import json
@@ -53,6 +53,22 @@ from colorama import Fore, Style, init as colorama_init
 colorama_init(autoreset=True)
 
 
+def _load_dotenv(path: Path = Path(".env")) -> None:
+    """Populate os.environ from a local .env file (KEY=VALUE per line), without overriding
+    variables already set in the environment."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
+
 def c(text: str, color: str) -> str:
     return f"{color}{text}{Style.RESET_ALL}"
 
@@ -80,8 +96,40 @@ def banner(title: str, color: str = Fore.CYAN, width: int = 60) -> None:
     print(c(line, color))
 
 
+class Spinner:
+    """Prints a spinner + elapsed time on the current line for blocking calls
+    that have no native progress reporting (model load, ffmpeg extraction, ...).
+    """
+    _FRAMES = "|/-\\"
+
+    def __init__(self, message: str):
+        self.message = message
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        start = time.perf_counter()
+        i = 0
+        while not self._stop.is_set():
+            elapsed = time.perf_counter() - start
+            frame = self._FRAMES[i % len(self._FRAMES)]
+            line = f"{frame} {self.message} ({_fmt_duration(elapsed)})"
+            print(f"\r{c(line, Fore.CYAN)}", end="", flush=True)
+            i += 1
+            self._stop.wait(0.2)
+        print("\r" + " " * (len(self.message) + 20) + "\r", end="", flush=True)
+
+    def __enter__(self) -> "Spinner":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self._stop.set()
+        self._thread.join()
+
+
 # Put your Hugging Face token here if you don't want to use env vars (do NOT commit a real token):
-HUGGINGFACE_TOKEN = "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # <-- replace with your token, or leave and set HUGGINGFACE_TOKEN/HF_TOKEN env var instead
+HUGGINGFACE_TOKEN = ""  # <-- leave blank; set HUGGINGFACE_TOKEN in a local .env file instead (see .env.example)
 
 # Optional (speaker diarization)
 ENABLE_DIARIZATION = True
@@ -146,6 +194,7 @@ def _has_prior_outputs(base_dir: Path, audio_stem: str) -> bool:
 def _list_unprocessed_audio_candidates(base_dir: Path) -> list[str]:
     """Run cleanup then return audio files not yet in the processed manifest."""
     cleanup_old_runs(base_dir)
+    prompt_delete_archived_weeks(base_dir)
 
     all_audio = [f for f in os.listdir(base_dir) if f.lower().endswith(AUDIO_EXTENSIONS)]
     if not all_audio:
@@ -172,8 +221,17 @@ def _mark_processed(base_dir: Path, audio_path: str, run_id: str) -> None:
     _save_processed_db(base_dir, db)
 
 
+ARCHIVE_DIR_NAME = "archive"
+
+
+def _archive_week_dir(base_dir: Path, year: int, week: int) -> Path:
+    return base_dir / ARCHIVE_DIR_NAME / f"{year}-W{week:02d}"
+
+
 def cleanup_old_runs(base_dir: Path, log_name: str = "cleanup.log"):
-    """Delete run directories (e.g. <audio>-<uuid>) older than the current ISO week."""
+    """Move run directories (e.g. <audio>-<uuid>) older than the current ISO week into
+    an archive folder, grouped by the week they were created. Nothing is deleted here —
+    see prompt_delete_archived_weeks() for that."""
     now = datetime.now()
     current_year, current_week, _ = now.isocalendar()
     log_path = base_dir / log_name
@@ -193,13 +251,65 @@ def cleanup_old_runs(base_dir: Path, log_name: str = "cleanup.log"):
             mtime = datetime.fromtimestamp(entry.stat().st_mtime)
             year, week, _ = mtime.isocalendar()
             if (year, week) < (current_year, current_week):
-                log(f"Removing old run: {entry.name} (week={week}, year={year})")
-                shutil.rmtree(entry, ignore_errors=True)
-                log(f"Removed: {entry}")
+                dest_dir = _archive_week_dir(base_dir, year, week)
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = dest_dir / entry.name
+                log(f"Archiving old run: {entry.name} (week={week}, year={year}) -> {dest}")
+                shutil.move(str(entry), str(dest))
+                log(f"Archived: {dest}")
         except OSError as e:
             log(f"Skipped {entry}: {e}")
 
     log("Cleanup complete.\n")
+
+
+def prompt_delete_archived_weeks(base_dir: Path, log_name: str = "cleanup.log") -> None:
+    """Ask the user, once per archived week folder, whether it's OK to permanently delete it.
+
+    Archived weeks are never auto-deleted; this only removes a week folder when the user
+    confirms interactively, so nothing is lost without an explicit y/N answer.
+    """
+    archive_root = base_dir / ARCHIVE_DIR_NAME
+    if not archive_root.is_dir():
+        return
+
+    now = datetime.now()
+    current_year, current_week, _ = now.isocalendar()
+    log_path = base_dir / log_name
+
+    def log(message: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(f"[{ts}] {message}\n")
+
+    week_dirs = sorted(
+        d for d in archive_root.iterdir()
+        if d.is_dir() and re.match(r"^\d{4}-W\d{2}$", d.name)
+    )
+    for week_dir in week_dirs:
+        year_str, week_str = week_dir.name.split("-W")
+        year, week = int(year_str), int(week_str)
+        if (year, week) >= (current_year, current_week):
+            continue  # not old enough yet
+
+        runs = [e.name for e in week_dir.iterdir() if e.is_dir()]
+        if not runs:
+            week_dir.rmdir()
+            continue
+
+        warn(f"\nArchived week {week_dir.name} has {len(runs)} old run folder(s):")
+        for name in runs:
+            print(f"    - {name}")
+        ans = input(
+            c(f"Permanently delete archived week {week_dir.name}? [y/N]: ", Fore.YELLOW)
+        ).strip().lower()
+        if ans == "y":
+            shutil.rmtree(week_dir, ignore_errors=True)
+            log(f"Deleted archived week {week_dir.name} ({len(runs)} runs) after user confirmation.")
+            ok(f"Deleted {week_dir.name}.")
+        else:
+            log(f"User declined to delete archived week {week_dir.name}; left in place.")
+            info(f"Keeping {week_dir.name} for now.")
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -366,9 +476,9 @@ def _extract_audio_to_wav(src_path: Path, out_dir: Path, stem: str) -> Path:
         "-vn", "-ac", "1", "-ar", str(EXTRACT_SAMPLE_RATE), "-acodec", "pcm_s16le",
         str(out_path),
     ]
-    info(f"Extracting audio: {src_path.name} -> {out_path.name} ...")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        with Spinner(f"Extracting audio: {src_path.name} -> {out_path.name}"):
+            proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
         err("ffmpeg not found on PATH. Install ffmpeg (https://ffmpeg.org/) to convert video files.")
         raise SystemExit(2)
@@ -504,22 +614,23 @@ def _load_diarization_pipeline():
     try:
         # Try new huggingface_hub auth style first, fall back to legacy use_auth_token=
         try:
-            pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, token=token)
-            ok(f"Loaded diarization model '{DIARIZATION_MODEL}'.")
-            return pipeline
+            with Spinner(f"Loading diarization model '{DIARIZATION_MODEL}'"):
+                pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, token=token)
         except TypeError:
-            try:
+            with Spinner(f"Loading diarization model '{DIARIZATION_MODEL}' (legacy auth)"):
                 pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, use_auth_token=token)
-                ok(f"Loaded diarization model '{DIARIZATION_MODEL}' (legacy auth).")
-                return pipeline
-            except Exception as e:
-                err(f"Could not load diarization model ({DIARIZATION_MODEL}): {e}")
-                return None
-        except Exception as e:
-            err(f"Could not load diarization model ({DIARIZATION_MODEL}): {e}")
-            return None
+    except Exception as e:
+        err(f"Could not load diarization model ({DIARIZATION_MODEL}): {e}")
+        return None
     finally:
         torch.load = _orig_load
+
+    if torch.cuda.is_available():
+        pipeline.to(torch.device("cuda"))
+        ok(f"Loaded diarization model '{DIARIZATION_MODEL}' on CUDA.")
+    else:
+        ok(f"Loaded diarization model '{DIARIZATION_MODEL}' on CPU.")
+    return pipeline
 
 
 def run_diarization(audio_path: str, pipeline) -> list[dict]:
@@ -527,7 +638,9 @@ def run_diarization(audio_path: str, pipeline) -> list[dict]:
     if pipeline is None:
         return []
     try:
-        diarization = pipeline(audio_path)
+        from pyannote.audio.pipelines.utils.hook import ProgressHook
+        with ProgressHook() as hook:
+            diarization = pipeline(audio_path, hook=hook)
     except Exception as e:
         err(f"Diarization failed: {e}")
         return []
@@ -715,7 +828,7 @@ def main():
     banner("Speaker Diarization & Transcription")
     _print_cuda_info()
 
-    # Pre-load diarization pipeline before audio selection so failures are caught early
+    # Preload diarization pipeline before audio selection so failures are caught early
     diarization_pipeline = None
     if ENABLE_DIARIZATION:
         info("Checking diarization pipeline...")
@@ -764,9 +877,9 @@ def main():
 
     # Load model
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    info(f"Loading Whisper model '{MODEL_NAME}' on {device_type.upper()}...")
     t_load = time.perf_counter()
-    model = whisper.load_model(MODEL_NAME, device=device_type)
+    with Spinner(f"Loading Whisper model '{MODEL_NAME}' on {device_type.upper()}"):
+        model = whisper.load_model(MODEL_NAME, device=device_type)
     dt_load = time.perf_counter() - t_load
     fp16 = device_type == "cuda"
     logger.info("Model loaded: %s on %s (fp16=%s) in %s", MODEL_NAME, device_type, fp16, _fmt_duration(dt_load))
