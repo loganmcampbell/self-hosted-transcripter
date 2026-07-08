@@ -34,10 +34,6 @@ import threading
 import time
 import uuid
 import warnings
-
-# Suppress known harmless warnings from pyannote and torchaudio
-warnings.filterwarnings("ignore", message="std\\(\\).*degrees of freedom")
-warnings.filterwarnings("ignore", message=".*MPEG_LAYER_III subtype is unknown")
 from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
@@ -49,6 +45,11 @@ import torch
 import torch.version  # explicit submodule import so PyCharm resolves torch.version.cuda
 import whisper
 from colorama import Fore, Style, init as colorama_init
+from tqdm import tqdm
+
+# Suppress known harmless warnings from pyannote and torchaudio
+warnings.filterwarnings("ignore", message="std\\(\\).*degrees of freedom")
+warnings.filterwarnings("ignore", message=".*MPEG_LAYER_III subtype is unknown")
 
 colorama_init(autoreset=True)
 
@@ -315,7 +316,6 @@ def prompt_delete_archived_weeks(base_dir: Path, log_name: str = "cleanup.log") 
 def _fmt_duration(seconds: float) -> str:
     """Return a human-readable duration string, using the largest sensible unit."""
     s = int(seconds)
-    ms = round((seconds - s) * 1000)
     if s < 60:
         return f"{seconds:.2f}s"
     if s < 3600:
@@ -409,7 +409,7 @@ def _pick_working_samplerate(device: int | None, channels: int) -> int:
         devinfo = sd.query_devices(query_dev, "input")
         if devinfo and devinfo.get("default_samplerate"):
             candidates.append(int(devinfo["default_samplerate"]))
-    except Exception:
+    except (sd.PortAudioError, ValueError, TypeError):
         pass
     for r in PREF_SAMPLE_RATES:
         if r not in candidates:
@@ -419,7 +419,7 @@ def _pick_working_samplerate(device: int | None, channels: int) -> int:
         try:
             sd.check_input_settings(device=device, samplerate=sr, channels=channels, dtype="float32")
             return sr
-        except Exception as e:
+        except (sd.PortAudioError, ValueError, TypeError) as e:
             last_err = e
     if last_err:
         raise last_err
@@ -435,7 +435,7 @@ def _json_safe_segment(seg: dict) -> dict:
     def i(x):
         try:
             return int(x)
-        except Exception:
+        except (TypeError, ValueError):
             return None
 
     out: dict[str, Any] = {
@@ -562,7 +562,7 @@ def record_mic_until_enter(out_path: str | Path | None = None,
         finally:
             try:
                 stream.__exit__(None, None, None)
-            except Exception:
+            except (sd.PortAudioError, OSError):
                 pass
             while not q.empty():
                 try:
@@ -573,6 +573,45 @@ def record_mic_until_enter(out_path: str | Path | None = None,
 
     ok(f"Saved recording to: {out_path}\n")
     return str(out_path.resolve())
+
+
+class DiarizationProgressHook:
+    """Single-line tqdm progress bar for pyannote's diarization steps.
+
+    pyannote's built-in ProgressHook prints a new rich progress bar every time the
+    pipeline switches steps (segmentation, embeddings, clustering, ...), and since the
+    pipeline hops between steps per chunk, that stacks up into a wall of bars. This
+    keeps a single bar on one line, re-labeled and reset per step, matching the look
+    of Whisper's transcription progress bar.
+    """
+
+    def __init__(self):
+        self._bar: tqdm | None = None
+        self._step_name: str | None = None
+
+    def __enter__(self) -> "DiarizationProgressHook":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        if self._bar is not None:
+            self._bar.close()
+
+    def __call__(self, step_name: str, step_artifact, file=None, total=None, completed=None) -> None:
+        if completed is None:
+            completed = total = 1
+        if step_name != self._step_name:
+            if self._bar is not None:
+                self._bar.close()
+            self._step_name = step_name
+            self._bar = tqdm(
+                total=total, desc=f"Diarizing ({step_name})", unit="chunk",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            )
+        bar = self._bar
+        assert bar is not None
+        bar.total = total
+        bar.n = completed
+        bar.refresh()
 
 
 # -------- Diarization utils --------
@@ -615,6 +654,7 @@ def _load_diarization_pipeline():
         # Try new huggingface_hub auth style first, fall back to legacy use_auth_token=
         try:
             with Spinner(f"Loading diarization model '{DIARIZATION_MODEL}'"):
+                # noinspection PyArgumentList
                 pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, token=token)
         except TypeError:
             with Spinner(f"Loading diarization model '{DIARIZATION_MODEL}' (legacy auth)"):
@@ -638,8 +678,7 @@ def run_diarization(audio_path: str, pipeline) -> list[dict]:
     if pipeline is None:
         return []
     try:
-        from pyannote.audio.pipelines.utils.hook import ProgressHook
-        with ProgressHook() as hook:
+        with DiarizationProgressHook() as hook:
             diarization = pipeline(audio_path, hook=hook)
     except Exception as e:
         err(f"Diarization failed: {e}")
@@ -653,7 +692,7 @@ def run_diarization(audio_path: str, pipeline) -> list[dict]:
 
     speaker_map: dict[str, str] = {}
     for t in turns:
-        spk = t["speaker"]
+        spk = str(t["speaker"])
         if spk not in speaker_map:
             speaker_map[spk] = f"SPEAKER_{len(speaker_map):02d}"
         t["speaker"] = speaker_map[spk]
@@ -813,12 +852,10 @@ def _log_segments(logger: logging.Logger, segments: list, use_sentence_split: bo
         if use_sentence_split:
             for s in sentence_split(seg_text):
                 logger.info("SENT %04d [%7.2f-%7.2f] %s", sent_id, seg.get("start", 0.0), seg.get("end", 0.0), s)
-                print(c(">>> ", Fore.BLUE) + s)
                 sent_id += 1
         else:
             logger.info("SEG  %04d [%7.2f-%7.2f] %s", seg.get("id", sent_id), seg.get("start", 0.0),
                         seg.get("end", 0.0), seg_text)
-            print(c(">>> ", Fore.BLUE) + seg_text)
             sent_id += 1
 
 
@@ -889,14 +926,16 @@ def main():
     banner("Transcribing", Fore.GREEN)
     t0 = time.perf_counter()
     if USE_TEMPERATURE_FALLBACK:
+        # noinspection PyArgumentList
         result = model.transcribe(
-            audio_path, fp16=fp16, language=FORCE_LANGUAGE, verbose=True,
+            audio_path, fp16=fp16, language=FORCE_LANGUAGE, verbose=False,
             temperature=[0.0, 0.2, 0.4, 0.6], best_of=5, beam_size=5,
             condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
         )
     else:
+        # noinspection PyArgumentList
         result = model.transcribe(
-            audio_path, fp16=fp16, language=FORCE_LANGUAGE, verbose=True,
+            audio_path, fp16=fp16, language=FORCE_LANGUAGE, verbose=False,
             condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
         )
 
@@ -984,6 +1023,16 @@ def main():
             warn("Diarization skipped or returned no turns.")
     else:
         warn("Diarization disabled (ENABLE_DIARIZATION=False).")
+
+    # Move the original source file into the run's output dir now that every step that
+    # reads it (transcription, extraction, diarization) has finished. Mic recordings are
+    # already written straight into out_dir, so there's nothing to move for those.
+    if choice.lower() != "mic":
+        src = Path(source_path)
+        if src.exists() and src.parent.resolve() != out_dir.resolve():
+            dest = out_dir / src.name
+            shutil.move(str(src), str(dest))
+            ok(f"Moved source file to: {dest}")
 
     dt_total = time.perf_counter() - t_total
 

@@ -1,0 +1,12 @@
+# Optional: GPU-accelerated torch build for Windows/Linux with an NVIDIA GPU + CUDA 12.4 driver.
+# Install AFTER requirements.txt, so this overrides the CPU torch wheels with CUDA ones:
+#   pip install -r requirements.txt
+#   pip install -r requirements-cuda.txt
+#
+# Not applicable on macOS (no CUDA support there) — Mac users should stick to requirements.txt,
+# which installs CPU/MPS torch.
+--index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://pypi.org/simple
+torch==2.6.0+cu124
+torchaudio==2.6.0+cu124
+torchvision==0.21.0+cu124
