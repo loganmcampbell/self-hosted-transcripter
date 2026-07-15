@@ -81,7 +81,7 @@ without speaker labels.
 
 ## Features 🚀
 
-- Transcribes an existing audio/video file, or records straight from a mic until you press ENTER.
+- Transcribes one or more existing audio/video files in a batch, or records straight from a mic until you press ENTER.
 - Automatically extracts audio from video containers (`.mp4`, `.flv`, `.webm`, `.mkv`, `.mov`, `.avi`, `.wmv`, `.m4v`,
   `.ts`) to 16kHz mono WAV before transcription/diarization, since the diarization pipeline doesn't reliably read video
   containers directly.
@@ -99,7 +99,9 @@ without speaker labels.
 python best-speaker-diarization.py
 ```
 
-- You'll be prompted to pick an audio/video file from the current folder, or type `mic` to record from a microphone.
+- You'll be prompted to pick audio/video files from the current folder. Enter one number for a single file or
+  comma-separated numbers such as `1,2,3` for a batch. The full batch is shown for confirmation before transcription.
+  Alternatively, type `mic` to record from a microphone.
 - For mic recording, pick an input device (or leave blank for default), then press ENTER when you're done talking.
 - Everything for that run — logs, transcript, JSON, and diarized outputs — lands in a new `<audio_name>-<uuid>/` folder.
 
@@ -127,4 +129,3 @@ transcription at higher temperatures when quality is low |
 - This project's `.gitignore` excludes audio/video files, `.processed.json`, logs, and local editor config — recordings
   and transcripts of anything you process are meant to stay local, not get committed.
 - CUDA is optional but strongly recommended; without a GPU, `large-v3` transcription will be noticeably slower.
-

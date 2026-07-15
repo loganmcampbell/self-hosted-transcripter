@@ -797,13 +797,14 @@ def _setup_logging(out_dir: Path, audio_name: str, run_id: str) -> logging.Logge
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
     )
     info(f"Logging to {log_path}")
     return logging.getLogger("whisper")
 
 
-def _select_audio(base_dir: Path) -> str:
-    """Prompt the user to pick an audio file or mic, preferring unprocessed files."""
+def _select_audio(base_dir: Path) -> list[str]:
+    """Prompt for one or more audio files, preferring unprocessed files."""
     candidates = _list_unprocessed_audio_candidates(base_dir)
     if candidates:
         pool = candidates
@@ -814,20 +815,35 @@ def _select_audio(base_dir: Path) -> str:
             warn("\nAll audio files (already processed):")
         else:
             warn("No audio files found in current folder.")
-            return "mic"
+            return ["mic"]
     for i, file in enumerate(pool, start=1):
         print(f"  {c(f'[{i}]', Fore.MAGENTA)} {file}")
 
-    raw = input(c(f"\nSelect file by number or filename ('mic' to record) [{pool[0]}]: ", Fore.CYAN)).strip()
+    raw = input(c(
+        f"\nSelect file(s) by number (example: 1,2,3), filename, or 'mic' [{pool[0]}]: ",
+        Fore.CYAN,
+    )).strip()
     if not raw:
-        return pool[0]
+        return [pool[0]]
     if raw.lower() == "mic":
-        return "mic"
-    if raw.isdigit():
-        idx = int(raw)
-        if 1 <= idx <= len(pool):
-            return pool[idx - 1]
-    return raw
+        return ["mic"]
+
+    parts = [part.strip() for part in raw.split(",")]
+    if any(not part for part in parts):
+        raise ValueError("Selections must be comma-separated numbers or filenames (example: 1,2,3).")
+
+    selected: list[str] = []
+    for part in parts:
+        if part.isdigit():
+            idx = int(part)
+            if not 1 <= idx <= len(pool):
+                raise ValueError(f"Selection {idx} is outside the available range 1-{len(pool)}.")
+            choice = pool[idx - 1]
+        else:
+            choice = part
+        if choice not in selected:
+            selected.append(choice)
+    return selected
 
 
 def _resolve_audio_path(choice: str, base_dir: Path) -> tuple[str, str, str, Path]:
@@ -860,25 +876,15 @@ def _log_segments(logger: logging.Logger, segments: list, use_sentence_split: bo
 
 
 # -------- Main flow --------
-def main():
-    base_dir = Path.cwd()
-    banner("Speaker Diarization & Transcription")
-    _print_cuda_info()
-
-    # Preload diarization pipeline before audio selection so failures are caught early
-    diarization_pipeline = None
-    if ENABLE_DIARIZATION:
-        info("Checking diarization pipeline...")
-        diarization_pipeline = _load_diarization_pipeline()
-        if diarization_pipeline is None:
-            ans = input(
-                c("Diarization unavailable. Continue with transcription only? [y/N]: ", Fore.YELLOW)).strip().lower()
-            if ans != "y":
-                sys.exit(1)
-
-    banner("Select Audio Source", Fore.MAGENTA)
-    choice = _select_audio(base_dir)
-
+def _process_choice(
+        choice: str,
+        base_dir: Path,
+        diarization_pipeline,
+        model,
+        device_type: str,
+        fp16: bool,
+        dt_load: float,
+):
     if choice.lower() == "mic":
         device = None
         banner("Select Input Device", Fore.MAGENTA)
@@ -912,15 +918,7 @@ def main():
 
     t_total = time.perf_counter()
 
-    # Load model
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    t_load = time.perf_counter()
-    with Spinner(f"Loading Whisper model '{MODEL_NAME}' on {device_type.upper()}"):
-        model = whisper.load_model(MODEL_NAME, device=device_type)
-    dt_load = time.perf_counter() - t_load
-    fp16 = device_type == "cuda"
     logger.info("Model loaded: %s on %s (fp16=%s) in %s", MODEL_NAME, device_type, fp16, _fmt_duration(dt_load))
-    ok(f"Model loaded in {_fmt_duration(dt_load)}")
 
     # Transcribe
     banner("Transcribing", Fore.GREEN)
@@ -1051,6 +1049,65 @@ def main():
     if ENABLE_DIARIZATION:
         print(f"  Diarization:   {_fmt_duration(dt_diar)}")
     print(f"  Total:         {_fmt_duration(dt_total)}")
+
+
+def main():
+    base_dir = Path.cwd()
+    banner("Speaker Diarization & Transcription")
+    _print_cuda_info()
+
+    # Preload diarization pipeline before audio selection so failures are caught early.
+    diarization_pipeline = None
+    if ENABLE_DIARIZATION:
+        info("Checking diarization pipeline...")
+        diarization_pipeline = _load_diarization_pipeline()
+        if diarization_pipeline is None:
+            ans = input(
+                c("Diarization unavailable. Continue with transcription only? [y/N]: ", Fore.YELLOW)).strip().lower()
+            if ans != "y":
+                sys.exit(1)
+
+    banner("Select Audio Source", Fore.MAGENTA)
+    try:
+        choices = _select_audio(base_dir)
+    except ValueError as exc:
+        err(str(exc))
+        raise SystemExit(1) from exc
+
+    if "mic" in {choice.lower() for choice in choices} and len(choices) > 1:
+        err("Microphone recording cannot be combined with file selections.")
+        raise SystemExit(1)
+    for choice in choices:
+        if choice.lower() != "mic":
+            path = Path(choice) if Path(choice).is_absolute() else base_dir / choice
+            if not path.is_file():
+                err(f"Audio file not found: {path}")
+                raise SystemExit(1)
+
+    if len(choices) > 1:
+        banner(f"Confirm {len(choices)} Selected Files", Fore.YELLOW)
+        for index, selected in enumerate(choices, start=1):
+            print(f"  {index}. {selected}")
+        confirm = input(c(f"\nTranscribe all {len(choices)} files? [y/N]: ", Fore.YELLOW)).strip().lower()
+        if confirm not in {"y", "yes"}:
+            warn("Batch transcription cancelled; no files were processed.")
+            return
+
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    t_load = time.perf_counter()
+    with Spinner(f"Loading Whisper model '{MODEL_NAME}' on {device_type.upper()}"):
+        model = whisper.load_model(MODEL_NAME, device=device_type)
+    dt_load = time.perf_counter() - t_load
+    fp16 = device_type == "cuda"
+    ok(f"Model loaded in {_fmt_duration(dt_load)}")
+
+    for index, choice in enumerate(choices, start=1):
+        if len(choices) > 1:
+            banner(f"Batch File {index} of {len(choices)}: {choice}", Fore.MAGENTA)
+        _process_choice(choice, base_dir, diarization_pipeline, model, device_type, fp16, dt_load)
+
+    if len(choices) > 1:
+        banner(f"Batch Complete: {len(choices)} Files", Fore.GREEN)
 
 
 if __name__ == "__main__":
