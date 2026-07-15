@@ -885,6 +885,7 @@ def _process_choice(
         fp16: bool,
         dt_load: float,
 ):
+    t_total = time.perf_counter()
     if choice.lower() == "mic":
         device = None
         banner("Select Input Device", Fore.MAGENTA)
@@ -915,8 +916,6 @@ def _process_choice(
         if Path(source_path).suffix.lower() in VIDEO_EXTENSIONS:
             banner("Extracting Audio", Fore.MAGENTA)
             audio_path = str(_extract_audio_to_wav(Path(source_path), out_dir, audio_name))
-
-    t_total = time.perf_counter()
 
     logger.info("Model loaded: %s on %s (fp16=%s) in %s", MODEL_NAME, device_type, fp16, _fmt_duration(dt_load))
 
@@ -1049,9 +1048,16 @@ def _process_choice(
     if ENABLE_DIARIZATION:
         print(f"  Diarization:   {_fmt_duration(dt_diar)}")
     print(f"  Total:         {_fmt_duration(dt_total)}")
+    return {
+        "name": audio_name,
+        "transcription_seconds": dt,
+        "diarization_seconds": dt_diar,
+        "total_seconds": dt_total,
+    }
 
 
 def main():
+    t_whole_process = time.perf_counter()
     base_dir = Path.cwd()
     banner("Speaker Diarization & Transcription")
     _print_cuda_info()
@@ -1101,13 +1107,56 @@ def main():
     fp16 = device_type == "cuda"
     ok(f"Model loaded in {_fmt_duration(dt_load)}")
 
+    runtime_results = []
     for index, choice in enumerate(choices, start=1):
         if len(choices) > 1:
             banner(f"Batch File {index} of {len(choices)}: {choice}", Fore.MAGENTA)
-        _process_choice(choice, base_dir, diarization_pipeline, model, device_type, fp16, dt_load)
+        runtime_results.append(
+            _process_choice(choice, base_dir, diarization_pipeline, model, device_type, fp16, dt_load)
+        )
 
     if len(choices) > 1:
         banner(f"Batch Complete: {len(choices)} Files", Fore.GREEN)
+
+    whole_process_seconds = time.perf_counter() - t_whole_process
+    aggregate_file_seconds = sum(item["total_seconds"] for item in runtime_results)
+    aggregate_transcription_seconds = sum(item["transcription_seconds"] for item in runtime_results)
+    aggregate_diarization_seconds = sum(item["diarization_seconds"] for item in runtime_results)
+
+    summary_logger = logging.getLogger("whisper")
+    summary_logger.info("Complete runtime summary for %d file(s)", len(runtime_results))
+    for item in runtime_results:
+        summary_logger.info(
+            "RUNTIME %s transcription=%s diarization=%s total=%s",
+            item["name"],
+            _fmt_duration(item["transcription_seconds"]),
+            _fmt_duration(item["diarization_seconds"]),
+            _fmt_duration(item["total_seconds"]),
+        )
+    summary_logger.info(
+        "RUNTIME TOTAL model_load=%s transcription=%s diarization=%s file_processing=%s whole_process=%s",
+        _fmt_duration(dt_load),
+        _fmt_duration(aggregate_transcription_seconds),
+        _fmt_duration(aggregate_diarization_seconds),
+        _fmt_duration(aggregate_file_seconds),
+        _fmt_duration(whole_process_seconds),
+    )
+
+    banner("Complete Runtime Summary", Fore.CYAN)
+    for index, item in enumerate(runtime_results, start=1):
+        print(f"  [{index}] {item['name']}")
+        print(f"      Transcription: {_fmt_duration(item['transcription_seconds'])}")
+        if ENABLE_DIARIZATION:
+            print(f"      Diarization:   {_fmt_duration(item['diarization_seconds'])}")
+        print(f"      File total:    {_fmt_duration(item['total_seconds'])}")
+    print(c("\nCombined:", Fore.CYAN + Style.BRIGHT))
+    print(f"  Files completed:        {len(runtime_results)}")
+    print(f"  Model load:             {_fmt_duration(dt_load)}")
+    print(f"  Total transcription:    {_fmt_duration(aggregate_transcription_seconds)}")
+    if ENABLE_DIARIZATION:
+        print(f"  Total diarization:      {_fmt_duration(aggregate_diarization_seconds)}")
+    print(f"  Total file processing:  {_fmt_duration(aggregate_file_seconds)}")
+    print(f"  Whole process runtime:  {_fmt_duration(whole_process_seconds)}")
 
 
 if __name__ == "__main__":

@@ -92,6 +92,7 @@ without speaker labels.
 - Weekly cleanup of old per-run output folders (anything older than the current ISO week gets removed automatically,
   logged to `cleanup.log`).
 - Color-coded terminal output (status/success/warning/error) for easier reading of long transcription runs.
+- Prints a complete runtime summary after single-file and batch runs, including per-file and aggregate timings.
 
 ## Usage
 
