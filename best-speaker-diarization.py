@@ -182,8 +182,19 @@ def _save_processed_db(base_dir: Path, data: dict) -> None:
 
 
 def _has_prior_outputs(base_dir: Path, audio_stem: str) -> bool:
-    """Return True if any output dir for this audio stem already contains a transcript."""
-    for entry in base_dir.iterdir():
+    """Return True if a current or archived run for this audio stem has a transcript."""
+    entries = [entry for entry in base_dir.iterdir() if entry.is_dir()]
+    entries.extend(
+        entry
+        for week_dir in base_dir.iterdir()
+        if week_dir.is_dir() and re.fullmatch(r"\d{4}-W\d{2}", week_dir.name)
+        for entry in week_dir.iterdir()
+        if entry.is_dir()
+    )
+    archive_root = base_dir / ARCHIVE_DIR_NAME
+    if archive_root.is_dir():
+        entries.extend(entry for entry in archive_root.rglob("*") if entry.is_dir())
+    for entry in entries:
         if not entry.is_dir() or not entry.name.startswith(f"{audio_stem}-"):
             continue
         for f in entry.glob("*.txt"):
@@ -192,22 +203,41 @@ def _has_prior_outputs(base_dir: Path, audio_stem: str) -> bool:
     return False
 
 
+def _has_processing_history(base_dir: Path, media_name: str) -> bool:
+    """Return True when the manifest or cleanup log shows this media ran before."""
+    media_name_folded = media_name.casefold()
+    for recorded_path, record in _load_processed_db(base_dir).items():
+        if record.get("processed") and Path(recorded_path).name.casefold() == media_name_folded:
+            return True
+
+    log_path = base_dir / "cleanup.log"
+    if not log_path.is_file():
+        return False
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    stem = Path(media_name).stem
+    run_name = re.compile(rf"\b{re.escape(stem)}-[0-9a-fA-F]{{8}}-[0-9a-fA-F-]{{27,}}\b", re.IGNORECASE)
+    return run_name.search(log_text) is not None
+
+
 def _list_unprocessed_audio_candidates(base_dir: Path) -> list[str]:
     """Run cleanup then return audio files not yet in the processed manifest."""
     cleanup_old_runs(base_dir)
+    sanitize_processed_media(base_dir)
     prompt_delete_archived_weeks(base_dir)
 
     all_audio = [f for f in os.listdir(base_dir) if f.lower().endswith(AUDIO_EXTENSIONS)]
     if not all_audio:
         return []
 
-    db = _load_processed_db(base_dir)
     unprocessed = []
     for name in sorted(all_audio):
-        abs_path = str((base_dir / name).resolve())
         stem = Path(name).stem
-        already_marked = db.get(abs_path, {}).get("processed", False)
-        if not (already_marked or _has_prior_outputs(base_dir, stem)):
+        # A manifest entry is historical evidence, not proof that the outputs still
+        # exist. If the run directory was deleted, offer the source for a rerun.
+        if not _has_prior_outputs(base_dir, stem):
             unprocessed.append(name)
     return unprocessed
 
@@ -225,14 +255,102 @@ def _mark_processed(base_dir: Path, audio_path: str, run_id: str) -> None:
 ARCHIVE_DIR_NAME = "archive"
 
 
+def _current_week_dir(base_dir: Path, create: bool = False) -> Path:
+    year, week, _ = datetime.now().isocalendar()
+    week_dir = base_dir / f"{year}-W{week:02d}"
+    if create:
+        week_dir.mkdir(parents=True, exist_ok=True)
+    return week_dir
+
+
+def sanitize_processed_media(base_dir: Path, log_name: str = "cleanup.log") -> dict[str, int]:
+    """Move root media into an unambiguous existing completed run directory.
+
+    Current and archived run directories are considered. A match must use the
+    <audio-stem>-<uuid> convention and contain the transcript (.txt) that only gets
+    written once transcription finishes, so interrupted runs are never matched.
+    Existing files are never overwritten and ambiguous matches remain untouched.
+    """
+    stats = {"moved": 0, "skipped": 0}
+    log_path = base_dir / log_name
+
+    def log(message: str) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{timestamp}] Sanitizer: {message}\n")
+        print(f"Sanitizer: {message}")
+
+    root_media = sorted(
+        path for path in base_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+    )
+    if not root_media:
+        return stats
+
+    candidate_dirs = [path for path in base_dir.iterdir() if path.is_dir()]
+    candidate_dirs.extend(
+        path
+        for week_dir in base_dir.iterdir()
+        if week_dir.is_dir() and re.fullmatch(r"\d{4}-W\d{2}", week_dir.name)
+        for path in week_dir.iterdir()
+        if path.is_dir()
+    )
+    archive_root = base_dir / ARCHIVE_DIR_NAME
+    if archive_root.is_dir():
+        candidate_dirs.extend(path for path in archive_root.rglob("*") if path.is_dir())
+    processed_db = _load_processed_db(base_dir)
+
+    for media_path in root_media:
+        stem = media_path.stem
+        run_pattern = re.compile(rf"^{re.escape(stem)}-([0-9a-fA-F]{{8}}-[0-9a-fA-F-]{{27,}})$")
+        matches: list[tuple[Path, str]] = []
+        for run_dir in candidate_dirs:
+            match = run_pattern.match(run_dir.name)
+            if not match:
+                continue
+            run_id = match.group(1)
+            # Only the transcript proves the run actually finished. The .log file is
+            # created the instant logging starts (before transcription runs), so an
+            # interrupted run would otherwise look "complete" and swallow the source file.
+            transcript = run_dir / f"{stem}-{run_id}.txt"
+            if transcript.is_file():
+                matches.append((run_dir, run_id))
+
+        if len(matches) > 1:
+            db_run_id = processed_db.get(str(media_path.resolve()), {}).get("run_id")
+            preferred = [item for item in matches if item[1] == db_run_id]
+            if len(preferred) == 1:
+                matches = preferred
+
+        if len(matches) != 1:
+            if matches:
+                log(f"Skipped {media_path.name}: found {len(matches)} matching completed runs.")
+                stats["skipped"] += 1
+            continue
+
+        run_dir, _ = matches[0]
+        destination = run_dir / media_path.name
+        if destination.exists():
+            log(f"Skipped {media_path.name}: destination already exists at {destination}.")
+            stats["skipped"] += 1
+            continue
+        try:
+            shutil.move(str(media_path), str(destination))
+            log(f"Moved {media_path.name} -> {destination}")
+            stats["moved"] += 1
+        except OSError as exc:
+            log(f"Could not move {media_path.name}: {exc}")
+            stats["skipped"] += 1
+
+    return stats
+
+
 def _archive_week_dir(base_dir: Path, year: int, week: int) -> Path:
     return base_dir / ARCHIVE_DIR_NAME / f"{year}-W{week:02d}"
 
 
 def cleanup_old_runs(base_dir: Path, log_name: str = "cleanup.log"):
-    """Move run directories (e.g. <audio>-<uuid>) older than the current ISO week into
-    an archive folder, grouped by the week they were created. Nothing is deleted here —
-    see prompt_delete_archived_weeks() for that."""
+    """Archive prior ISO-week folders and legacy root-level run directories."""
     now = datetime.now()
     current_year, current_week, _ = now.isocalendar()
     log_path = base_dir / log_name
@@ -245,6 +363,28 @@ def cleanup_old_runs(base_dir: Path, log_name: str = "cleanup.log"):
 
     log(f"Starting cleanup (current week={current_week}, year={current_year})")
 
+    # New layout: each active week is already grouped at the project root. Once
+    # that week is past, move the whole folder into archive in one operation.
+    for week_dir in base_dir.iterdir():
+        match = re.fullmatch(r"(\d{4})-W(\d{2})", week_dir.name) if week_dir.is_dir() else None
+        if not match:
+            continue
+        year, week = int(match.group(1)), int(match.group(2))
+        if (year, week) >= (current_year, current_week):
+            continue
+        destination = base_dir / ARCHIVE_DIR_NAME / week_dir.name
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                log(f"Skipped weekly archive {week_dir.name}: destination already exists at {destination}")
+                continue
+            log(f"Archiving completed week: {week_dir.name} -> {destination}")
+            shutil.move(str(week_dir), str(destination))
+            log(f"Archived week: {destination}")
+        except OSError as e:
+            log(f"Skipped weekly archive {week_dir}: {e}")
+
+    # Backward compatibility for runs created before weekly grouping was added.
     for entry in base_dir.iterdir():
         if not entry.is_dir() or not re.match(r".+-[0-9a-fA-F\-]{8,}", entry.name):
             continue
@@ -817,16 +957,21 @@ def _select_audio(base_dir: Path) -> list[str]:
             warn("No audio files found in current folder.")
             return ["mic"]
     for i, file in enumerate(pool, start=1):
-        print(f"  {c(f'[{i}]', Fore.MAGENTA)} {file}")
+        history_note = ""
+        if _has_processing_history(base_dir, file) and not _has_prior_outputs(base_dir, Path(file).stem):
+            history_note = c("  [previously transcribed; outputs missing — rerun available]", Fore.YELLOW)
+        print(f"  {c(f'[{i}]', Fore.MAGENTA)} {file}{history_note}")
 
     raw = input(c(
-        f"\nSelect file(s) by number (example: 1,2,3), filename, or 'mic' [{pool[0]}]: ",
+        f"\nSelect file(s) by number (example: 1,2,3), 'all', filename, or 'mic' [{pool[0]}]: ",
         Fore.CYAN,
     )).strip()
     if not raw:
         return [pool[0]]
     if raw.lower() == "mic":
         return ["mic"]
+    if raw.lower() == "all":
+        return list(pool)
 
     parts = [part.strip() for part in raw.split(",")]
     if any(not part for part in parts):
@@ -854,7 +999,7 @@ def _resolve_audio_path(choice: str, base_dir: Path) -> tuple[str, str, str, Pat
         raise SystemExit(1)
     audio_name = p.stem
     run_id = str(uuid.uuid4())
-    out_dir = base_dir / f"{audio_name}-{run_id}"
+    out_dir = _current_week_dir(base_dir, create=True) / f"{audio_name}-{run_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
     return str(p.resolve()), audio_name, run_id, out_dir
 
@@ -899,7 +1044,7 @@ def _process_choice(
                     warn("Invalid device index; using default device.")
         audio_name = "mic"
         run_id = str(uuid.uuid4())
-        out_dir = base_dir / f"{audio_name}-{run_id}"
+        out_dir = _current_week_dir(base_dir, create=True) / f"{audio_name}-{run_id}"
         out_dir.mkdir(parents=True, exist_ok=True)
         logger = _setup_logging(out_dir, audio_name, run_id)
         audio_path = record_mic_until_enter(
@@ -1089,6 +1234,8 @@ def main():
             if not path.is_file():
                 err(f"Audio file not found: {path}")
                 raise SystemExit(1)
+            if _has_processing_history(base_dir, path.name) and not _has_prior_outputs(base_dir, path.stem):
+                warn(f"{path.name} was previously transcribed, but its outputs are missing; it will be rerun.")
 
     if len(choices) > 1:
         banner(f"Confirm {len(choices)} Selected Files", Fore.YELLOW)

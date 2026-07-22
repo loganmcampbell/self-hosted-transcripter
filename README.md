@@ -89,6 +89,11 @@ without speaker labels.
   transcript.
 - De-duplicates Whisper's hallucinated repeated phrases/sentences (a known Whisper quirk on silence or noisy audio).
 - Tracks already-processed files in `.processed.json` so re-running the script won't reprocess the same audio twice.
+- Verifies that tracked output files still exist. If prior outputs were deleted, the original media is offered again and
+  labeled as previously transcribed with a rerun available.
+- Sanitizes root media before file selection by moving previously transcribed files into their matching current or
+  archived run directory. It requires an unambiguous completed-run match, never overwrites files, and records moves or
+  skips in `cleanup.log`.
 - Weekly cleanup of old per-run output folders (anything older than the current ISO week gets removed automatically,
   logged to `cleanup.log`).
 - Color-coded terminal output (status/success/warning/error) for easier reading of long transcription runs.
@@ -100,15 +105,17 @@ without speaker labels.
 python best-speaker-diarization.py
 ```
 
-- You'll be prompted to pick audio/video files from the current folder. Enter one number for a single file or
-  comma-separated numbers such as `1,2,3` for a batch. The full batch is shown for confirmation before transcription.
-  Alternatively, type `mic` to record from a microphone.
+- You'll be prompted to pick audio/video files from the current folder. Enter one number for a single file,
+  comma-separated numbers such as `1,2,3` for a batch, or `all` to select every listed file. The full batch is shown for
+  confirmation before transcription. Alternatively, type `mic` to record from a microphone.
 - For mic recording, pick an input device (or leave blank for default), then press ENTER when you're done talking.
-- Everything for that run — logs, transcript, JSON, and diarized outputs — lands in a new `<audio_name>-<uuid>/` folder.
+- Everything for that run — logs, transcript, JSON, and diarized outputs — lands in a new
+  `<year>-W<week>/<audio_name>-<uuid>/` folder. When the next ISO week begins, the completed weekly folder is moved into
+  `archive/` as a unit.
 
 ## Output files
 
-For each run, `<audio_name>-<uuid>/` contains:
+For each run, `<year>-W<week>/<audio_name>-<uuid>/` contains:
 | File | Contents | |---|---| | `<audio>-<uuid>.log` | Sentence-level log with timestamps | | `<audio>-<uuid>.txt` |
 Full transcript, no speaker labels | | `<audio>-<uuid>.json` | Run metadata + raw Whisper segments | |
 `<audio>-<uuid>.wav` | Only present when recording from mic | | `<audio>-<uuid>-diarization.json` | Diarization turns +

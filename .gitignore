@@ -29,6 +29,8 @@ cleanup.log
 
 # Editor / local config / secrets
 .idea/
+.agents/
+.claude/
 .mcp.json
 .env
 __pycache__/
