@@ -284,11 +284,12 @@ def _has_processing_history(base_dir: Path, media_name: str) -> bool:
     return run_name.search(log_text) is not None
 
 
-def _list_unprocessed_audio_candidates(base_dir: Path) -> list[str]:
+def _list_unprocessed_audio_candidates(base_dir: Path, run_cleanup: bool = True) -> list[str]:
     """Run cleanup then return audio files not yet in the processed manifest."""
-    cleanup_old_runs(base_dir)
-    sanitize_processed_media(base_dir)
-    prompt_delete_archived_weeks(base_dir)
+    if run_cleanup:
+        cleanup_old_runs(base_dir)
+        sanitize_processed_media(base_dir)
+        prompt_delete_archived_weeks(base_dir)
 
     all_audio = [f for f in os.listdir(base_dir) if f.lower().endswith(AUDIO_EXTENSIONS)]
     if not all_audio:
@@ -1021,9 +1022,9 @@ def _setup_logging(out_dir: Path, audio_name: str, run_id: str) -> logging.Logge
     return logging.getLogger("whisper")
 
 
-def _select_audio(base_dir: Path) -> list[str]:
+def _select_audio(base_dir: Path, run_cleanup: bool = True) -> list[str]:
     """Prompt for one or more audio files, preferring unprocessed files."""
-    candidates = _list_unprocessed_audio_candidates(base_dir)
+    candidates = _list_unprocessed_audio_candidates(base_dir, run_cleanup=run_cleanup)
     resumable = _find_resumable_runs(base_dir)
     resume_choices = [str(path) for path in resumable]
     if candidates:
@@ -1038,7 +1039,15 @@ def _select_audio(base_dir: Path) -> list[str]:
             warn("\nAll audio files (already processed):")
         else:
             warn("No audio files found in current folder.")
-            return ["mic"]
+            raw = input(c(
+                "Type 'refresh' to scan again, 'mic' to record, or 'exit' to close: ",
+                Fore.CYAN,
+            )).strip().lower()
+            if raw in {"exit", "quit", "close"}:
+                return ["exit"]
+            if raw == "mic":
+                return ["mic"]
+            return ["refresh"]
     for i, file in enumerate(pool, start=1):
         history_note = ""
         if Path(file).is_dir() and _run_identity(Path(file)):
@@ -1048,13 +1057,18 @@ def _select_audio(base_dir: Path) -> list[str]:
         print(f"  {c(f'[{i}]', Fore.MAGENTA)} {file}{history_note}")
 
     raw = input(c(
-        f"\nSelect file(s) by number (example: 1,2,3), 'all', filename, or 'mic' [{pool[0]}]: ",
+        f"\nSelect file(s) by number (example: 1,2,3), 'all', filename, "
+        f"'mic', 'refresh', or 'exit' [{pool[0]}]: ",
         Fore.CYAN,
     )).strip()
     if not raw:
         return [pool[0]]
     if raw.lower() == "mic":
         return ["mic"]
+    if raw.lower() in {"exit", "quit", "close"}:
+        return ["exit"]
+    if raw.lower() in {"refresh", "rescan"}:
+        return ["refresh"]
     if raw.lower() == "all":
         return list(pool)
 
@@ -1334,53 +1348,74 @@ def main():
             if ans != "y":
                 sys.exit(1)
 
-    banner("Select Audio Source", Fore.MAGENTA)
-    try:
-        choices = _select_audio(base_dir)
-    except ValueError as exc:
-        err(str(exc))
-        raise SystemExit(1) from exc
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    fp16 = device_type == "cuda"
+    model = None
+    dt_load = 0.0
+    runtime_results = []
+    first_scan = True
+    while True:
+        banner("Select Audio Source", Fore.MAGENTA)
+        try:
+            choices = _select_audio(base_dir, run_cleanup=first_scan)
+        except ValueError as exc:
+            err(str(exc))
+            first_scan = False
+            continue
+        first_scan = False
 
-    if "mic" in {choice.lower() for choice in choices} and len(choices) > 1:
-        err("Microphone recording cannot be combined with file selections.")
-        raise SystemExit(1)
-    for choice in choices:
-        if choice.lower() != "mic":
+        command = choices[0].lower() if len(choices) == 1 else ""
+        if command == "exit":
+            info("Closing the program.")
+            break
+        if command == "refresh":
+            info("Refreshing available files...")
+            continue
+        if "mic" in {choice.lower() for choice in choices} and len(choices) > 1:
+            err("Microphone recording cannot be combined with file selections.")
+            continue
+
+        invalid_selection = False
+        for choice in choices:
+            if choice.lower() == "mic":
+                continue
             path = Path(choice) if Path(choice).is_absolute() else base_dir / choice
             if not path.is_file() and not (path.is_dir() and _run_identity(path)):
                 err(f"Audio file not found: {path}")
-                raise SystemExit(1)
-            if path.is_file() and _has_processing_history(base_dir, path.name) and not _has_prior_outputs(base_dir,
-                                                                                                          path.stem):
+                invalid_selection = True
+                break
+            if path.is_file() and _has_processing_history(base_dir, path.name) and not _has_prior_outputs(
+                    base_dir, path.stem):
                 warn(f"{path.name} was previously transcribed, but its outputs are missing; it will be rerun.")
+        if invalid_selection:
+            continue
 
-    if len(choices) > 1:
-        banner(f"Confirm {len(choices)} Selected Files", Fore.YELLOW)
-        for index, selected in enumerate(choices, start=1):
-            print(f"  {index}. {selected}")
-        confirm = input(c(f"\nTranscribe all {len(choices)} files? [y/N]: ", Fore.YELLOW)).strip().lower()
-        if confirm not in {"y", "yes"}:
-            warn("Batch transcription cancelled; no files were processed.")
-            return
-
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    t_load = time.perf_counter()
-    with Spinner(f"Loading Whisper model '{MODEL_NAME}' on {device_type.upper()}"):
-        model = whisper.load_model(MODEL_NAME, device=device_type)
-    dt_load = time.perf_counter() - t_load
-    fp16 = device_type == "cuda"
-    ok(f"Model loaded in {_fmt_duration(dt_load)}")
-
-    runtime_results = []
-    for index, choice in enumerate(choices, start=1):
         if len(choices) > 1:
-            banner(f"Batch File {index} of {len(choices)}: {choice}", Fore.MAGENTA)
-        runtime_results.append(
-            _process_choice(choice, base_dir, diarization_pipeline, model, device_type, fp16, dt_load)
-        )
+            banner(f"Confirm {len(choices)} Selected Files", Fore.YELLOW)
+            for index, selected in enumerate(choices, start=1):
+                print(f"  {index}. {selected}")
+            confirm = input(c(f"\nTranscribe all {len(choices)} files? [y/N]: ", Fore.YELLOW)).strip().lower()
+            if confirm not in {"y", "yes"}:
+                warn("Batch transcription cancelled; returning to file selection.")
+                continue
 
-    if len(choices) > 1:
-        banner(f"Batch Complete: {len(choices)} Files", Fore.GREEN)
+        if model is None:
+            t_load = time.perf_counter()
+            with Spinner(f"Loading Whisper model '{MODEL_NAME}' on {device_type.upper()}"):
+                model = whisper.load_model(MODEL_NAME, device=device_type)
+            dt_load = time.perf_counter() - t_load
+            ok(f"Model loaded in {_fmt_duration(dt_load)}")
+
+        for index, choice in enumerate(choices, start=1):
+            if len(choices) > 1:
+                banner(f"Batch File {index} of {len(choices)}: {choice}", Fore.MAGENTA)
+            runtime_results.append(
+                _process_choice(choice, base_dir, diarization_pipeline, model, device_type, fp16, dt_load)
+            )
+
+        if len(choices) > 1:
+            banner(f"Batch Complete: {len(choices)} Files", Fore.GREEN)
+        info("\nProcessing round complete. Refreshing the file list...")
 
     whole_process_seconds = time.perf_counter() - t_whole_process
     aggregate_file_seconds = sum(item["total_seconds"] for item in runtime_results)

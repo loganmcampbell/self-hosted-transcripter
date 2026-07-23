@@ -96,6 +96,9 @@ without speaker labels.
   speaker-tagged TXT/SRT/VTT files. If only stage 1 completed, the original run UUID and folder are reused and
   diarization picks up where it stopped.
 - Archived-week deletion prompts accept `skip` to keep all remaining weeks and continue directly to audio processing.
+- Keeps the program open after each processing round and automatically rescans for new files. The selection menu accepts
+  `refresh`/`rescan` to scan again and `exit`/`quit`/`close` to end the session; loaded models are reused between
+  rounds.
 - Sanitizes root media before file selection by moving previously transcribed files into their matching current or
   archived run directory. It requires an unambiguous completed-run match, never overwrites files, and records moves or
   skips in `cleanup.log`.
