@@ -91,6 +91,11 @@ without speaker labels.
 - Tracks already-processed files in `.processed.json` so re-running the script won't reprocess the same audio twice.
 - Verifies that tracked output files still exist. If prior outputs were deleted, the original media is offered again and
   labeled as previously transcribed with a rerun available.
+- Resumes interrupted run folders stage by stage. A valid Whisper JSON checkpoint skips transcription (and can rebuild a
+  missing plain-text transcript); a valid diarization JSON skips the diarization model and rebuilds any missing
+  speaker-tagged TXT/SRT/VTT files. If only stage 1 completed, the original run UUID and folder are reused and
+  diarization picks up where it stopped.
+- Archived-week deletion prompts accept `skip` to keep all remaining weeks and continue directly to audio processing.
 - Sanitizes root media before file selection by moving previously transcribed files into their matching current or
   archived run directory. It requires an unambiguous completed-run match, never overwrites files, and records moves or
   skips in `cleanup.log`.

@@ -203,6 +203,68 @@ def _has_prior_outputs(base_dir: Path, audio_stem: str) -> bool:
     return False
 
 
+def _run_identity(run_dir: Path) -> tuple[str, str] | None:
+    """Return (audio stem, run UUID) for a run directory."""
+    match = re.fullmatch(
+        r"(.+)-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+        run_dir.name,
+    )
+    return (match.group(1), match.group(2)) if match else None
+
+
+def _valid_json(path: Path, required_key: str) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) and isinstance(payload.get(required_key), list) else None
+
+
+def _find_resumable_runs(base_dir: Path) -> list[Path]:
+    """Find interrupted runs that still contain their source media."""
+    runs: list[Path] = []
+    search_roots = [base_dir]
+    search_roots.extend(
+        path for path in base_dir.iterdir()
+        if path.is_dir() and (re.fullmatch(r"\d{4}-W\d{2}", path.name) or path.name == ARCHIVE_DIR_NAME)
+    )
+    for root in search_roots:
+        iterator = root.rglob("*") if root.name == ARCHIVE_DIR_NAME else root.iterdir()
+        for run_dir in iterator:
+            identity = _run_identity(run_dir) if run_dir.is_dir() else None
+            if not identity:
+                continue
+            stem, run_id = identity
+            source_files = [
+                path for path in run_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+                   and path.name not in {f"{stem}-extracted.wav"}
+            ]
+            transcript_json = run_dir / f"{stem}-{run_id}.json"
+            diar_json = run_dir / f"{stem}-{run_id}-diarization.json"
+            expected = [
+                run_dir / f"{stem}-{run_id}.txt",
+                transcript_json,
+                diar_json,
+                run_dir / f"{stem}-{run_id}-diarized.txt",
+                run_dir / f"{stem}-{run_id}-diarized.srt",
+                run_dir / f"{stem}-{run_id}-diarized.vtt",
+            ]
+            # Whisper JSON is the durable stage-1 checkpoint. The plain TXT can
+            # always be reconstructed from it without running the model again.
+            transcription_ok = _valid_json(transcript_json, "segments") is not None
+            diarization_ok = _valid_json(diar_json, "turns") is not None
+            complete = transcription_ok and (
+                    not ENABLE_DIARIZATION or (diarization_ok and all(path.is_file() for path in expected[3:]))
+            )
+            if source_files and not complete:
+                runs.append(run_dir)
+    return sorted(set(runs), key=lambda path: str(path).casefold())
+
+
 def _has_processing_history(base_dir: Path, media_name: str) -> bool:
     """Return True when the manifest or cleanup log shows this media ran before."""
     media_name_folded = media_name.casefold()
@@ -408,7 +470,8 @@ def prompt_delete_archived_weeks(base_dir: Path, log_name: str = "cleanup.log") 
     """Ask the user, once per archived week folder, whether it's OK to permanently delete it.
 
     Archived weeks are never auto-deleted; this only removes a week folder when the user
-    confirms interactively, so nothing is lost without an explicit y/N answer.
+    confirms interactively, so nothing is lost without an explicit yes answer. Entering
+    ``skip`` keeps every remaining week and continues to processing.
     """
     archive_root = base_dir / ARCHIVE_DIR_NAME
     if not archive_root.is_dir():
@@ -442,9 +505,24 @@ def prompt_delete_archived_weeks(base_dir: Path, log_name: str = "cleanup.log") 
         for name in runs:
             print(f"    - {name}")
         ans = input(
-            c(f"Permanently delete archived week {week_dir.name}? [y/N]: ", Fore.YELLOW)
+            c(
+                f"Permanently delete archived week {week_dir.name}? "
+                "[y/N/skip remaining]: ",
+                Fore.YELLOW,
+            )
         ).strip().lower()
-        if ans == "y":
+        if ans == "skip":
+            remaining_count = sum(
+                1 for remaining in week_dirs[week_dirs.index(week_dir):]
+                if remaining.is_dir()
+            )
+            log(
+                f"User skipped deletion prompts; kept {remaining_count} remaining "
+                "archived week(s)."
+            )
+            info("Keeping all remaining archived weeks; continuing to processing.")
+            return
+        if ans in {"y", "yes"}:
             shutil.rmtree(week_dir, ignore_errors=True)
             log(f"Deleted archived week {week_dir.name} ({len(runs)} runs) after user confirmation.")
             ok(f"Deleted {week_dir.name}.")
@@ -946,9 +1024,14 @@ def _setup_logging(out_dir: Path, audio_name: str, run_id: str) -> logging.Logge
 def _select_audio(base_dir: Path) -> list[str]:
     """Prompt for one or more audio files, preferring unprocessed files."""
     candidates = _list_unprocessed_audio_candidates(base_dir)
+    resumable = _find_resumable_runs(base_dir)
+    resume_choices = [str(path) for path in resumable]
     if candidates:
-        pool = candidates
-        info("\nAvailable (unprocessed) audio files:")
+        pool = resume_choices + candidates
+        info("\nAvailable interrupted runs and unprocessed audio files:")
+    elif resume_choices:
+        pool = resume_choices
+        info("\nAvailable interrupted runs:")
     else:
         pool = sorted(f for f in os.listdir(base_dir) if f.lower().endswith(AUDIO_EXTENSIONS))
         if pool:
@@ -958,7 +1041,9 @@ def _select_audio(base_dir: Path) -> list[str]:
             return ["mic"]
     for i, file in enumerate(pool, start=1):
         history_note = ""
-        if _has_processing_history(base_dir, file) and not _has_prior_outputs(base_dir, Path(file).stem):
+        if Path(file).is_dir() and _run_identity(Path(file)):
+            history_note = c("  [resume missing stages]", Fore.YELLOW)
+        elif _has_processing_history(base_dir, file) and not _has_prior_outputs(base_dir, Path(file).stem):
             history_note = c("  [previously transcribed; outputs missing — rerun available]", Fore.YELLOW)
         print(f"  {c(f'[{i}]', Fore.MAGENTA)} {file}{history_note}")
 
@@ -994,6 +1079,19 @@ def _select_audio(base_dir: Path) -> list[str]:
 def _resolve_audio_path(choice: str, base_dir: Path) -> tuple[str, str, str, Path]:
     """Resolve a filename choice to (audio_path, audio_name, run_id, out_dir)."""
     p = Path(choice) if Path(choice).is_absolute() else base_dir / choice
+    if p.is_dir():
+        identity = _run_identity(p)
+        if not identity:
+            raise ValueError(f"Not a valid run directory: {p}")
+        audio_name, run_id = identity
+        sources = [
+            path for path in p.iterdir()
+            if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+               and path.name != f"{audio_name}-extracted.wav"
+        ]
+        if not sources:
+            raise ValueError(f"No source audio/video remains in interrupted run: {p}")
+        return str(sources[0].resolve()), audio_name, run_id, p.resolve()
     if not p.exists():
         print(c(f"Audio file not found: {p}", Fore.RED), file=sys.stderr)
         raise SystemExit(1)
@@ -1064,67 +1162,75 @@ def _process_choice(
 
     logger.info("Model loaded: %s on %s (fp16=%s) in %s", MODEL_NAME, device_type, fp16, _fmt_duration(dt_load))
 
-    # Transcribe
-    banner("Transcribing", Fore.GREEN)
-    t0 = time.perf_counter()
-    if USE_TEMPERATURE_FALLBACK:
-        # noinspection PyArgumentList
-        result = model.transcribe(
-            audio_path, fp16=fp16, language=FORCE_LANGUAGE, verbose=False,
-            temperature=[0.0, 0.2, 0.4, 0.6], best_of=5, beam_size=5,
-            condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
-        )
-    else:
-        # noinspection PyArgumentList
-        result = model.transcribe(
-            audio_path, fp16=fp16, language=FORCE_LANGUAGE, verbose=False,
-            condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
-        )
-
-    dt = time.perf_counter() - t0
-    logger.info("Transcription finished in %s", _fmt_duration(dt))
-    ok(f"Done in {_fmt_duration(dt)}\n")
-
-    # Save transcript
-    full_text = dedup_transcript((result.get("text") or "").strip())
     transcript_file = out_dir / f"{audio_name}-{run_id}.txt"
-    transcript_file.write_text(full_text, encoding="utf-8")
-    ok(f"Transcript saved to: {transcript_file}")
-
-    # Log sentence-by-sentence
-    segments = result.get("segments") or []
-    if segments:
-        _log_segments(logger, segments, USE_SENTENCE_SPLIT)
-
-    # Save JSON
     json_file = out_dir / f"{audio_name}-{run_id}.json"
-    payload: dict[str, Any] = {
-        "meta": {
-            "audio_name": audio_name,
-            "run_id": run_id,
-            "created_at": datetime.now(UTC).isoformat(),
-            "source_path": str(source_path),
-            "input_path": str(audio_path),
-            "output_dir": str(out_dir),
-            "model": MODEL_NAME,
-            "device": device_type,
-            "fp16": fp16,
-            "duration_seconds": float(dt),
-            "whisper_params": {
-                "language_forced": FORCE_LANGUAGE,
-                "sentence_split": USE_SENTENCE_SPLIT,
-                "task": result.get("task"),
+    saved_transcription = _valid_json(json_file, "segments")
+    if saved_transcription is not None:
+        banner("Transcription Already Complete", Fore.GREEN)
+        result = saved_transcription
+        segments = result["segments"]
+        full_text = str(result.get("text") or "")
+        if not full_text and transcript_file.is_file():
+            full_text = transcript_file.read_text(encoding="utf-8")
+        if not transcript_file.is_file():
+            transcript_file.write_text(full_text, encoding="utf-8")
+            ok(f"Rebuilt missing transcript: {transcript_file}")
+        dt = 0.0
+        ok(f"Reusing transcript and Whisper segments from: {json_file}")
+        logger.info("Resume: transcription artifacts validated; stage skipped")
+    else:
+        banner("Transcribing", Fore.GREEN)
+        t0 = time.perf_counter()
+        if USE_TEMPERATURE_FALLBACK:
+            # noinspection PyArgumentList
+            result = model.transcribe(
+                audio_path, fp16=fp16, language=FORCE_LANGUAGE, verbose=False,
+                temperature=[0.0, 0.2, 0.4, 0.6], best_of=5, beam_size=5,
+                condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+            )
+        else:
+            # noinspection PyArgumentList
+            result = model.transcribe(
+                audio_path, fp16=fp16, language=FORCE_LANGUAGE, verbose=False,
+                condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+            )
+
+        dt = time.perf_counter() - t0
+        logger.info("Transcription finished in %s", _fmt_duration(dt))
+        ok(f"Done in {_fmt_duration(dt)}\n")
+        full_text = dedup_transcript((result.get("text") or "").strip())
+        transcript_file.write_text(full_text, encoding="utf-8")
+        ok(f"Transcript saved to: {transcript_file}")
+        segments = result.get("segments") or []
+        if segments:
+            _log_segments(logger, segments, USE_SENTENCE_SPLIT)
+        payload: dict[str, Any] = {
+            "meta": {
+                "audio_name": audio_name,
+                "run_id": run_id,
+                "created_at": datetime.now(UTC).isoformat(),
+                "source_path": str(source_path),
+                "input_path": str(audio_path),
+                "output_dir": str(out_dir),
+                "model": MODEL_NAME,
+                "device": device_type,
+                "fp16": fp16,
+                "duration_seconds": float(dt),
+                "whisper_params": {
+                    "language_forced": FORCE_LANGUAGE,
+                    "sentence_split": USE_SENTENCE_SPLIT,
+                    "task": result.get("task"),
+                },
+                "language": {
+                    "detected": result.get("language"),
+                    "probability": result.get("language_probability") or result.get("detected_language_probability"),
+                },
             },
-            "language": {
-                "detected": result.get("language"),
-                "probability": result.get("language_probability") or result.get("detected_language_probability"),
-            },
-        },
-        "text": full_text,
-        "segments": [_json_safe_segment(s) for s in segments],
-    }
-    json_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    ok(f"JSON saved to: {json_file}")
+            "text": full_text,
+            "segments": [_json_safe_segment(s) for s in segments],
+        }
+        json_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        ok(f"JSON saved to: {json_file}")
 
     try:
         _mark_processed(base_dir, source_path, run_id)
@@ -1135,27 +1241,37 @@ def _process_choice(
     diar_turns: list = []
     dt_diar = 0.0
     if ENABLE_DIARIZATION and diarization_pipeline is not None:
-        banner("Diarization", Fore.GREEN)
-        t_diar = time.perf_counter()
-        diar_turns = run_diarization(audio_path, diarization_pipeline)
-        dt_diar = time.perf_counter() - t_diar
-        logger.info("Diarization finished in %s", _fmt_duration(dt_diar))
-        ok(f"Diarization done in {_fmt_duration(dt_diar)}")
+        diar_json_file = out_dir / f"{audio_name}-{run_id}-diarization.json"
+        saved_diarization = _valid_json(diar_json_file, "turns")
+        if saved_diarization is not None:
+            banner("Diarization Already Complete", Fore.GREEN)
+            diar_turns = saved_diarization["turns"]
+            diar_items = saved_diarization.get("whisper_segments_mapped")
+            if not isinstance(diar_items, list):
+                diar_items = map_segments_to_speakers(segments, diar_turns)
+            ok(f"Reusing diarization turns from: {diar_json_file}")
+            logger.info("Resume: diarization JSON validated; model stage skipped")
+        else:
+            banner("Diarization", Fore.GREEN)
+            t_diar = time.perf_counter()
+            diar_turns = run_diarization(audio_path, diarization_pipeline)
+            dt_diar = time.perf_counter() - t_diar
+            logger.info("Diarization finished in %s", _fmt_duration(dt_diar))
+            ok(f"Diarization done in {_fmt_duration(dt_diar)}")
         if diar_turns:
             diar_items = map_segments_to_speakers(segments, diar_turns)
-
-            diar_json_file = out_dir / f"{audio_name}-{run_id}-diarization.json"
-            diar_json_file.write_text(json.dumps({
-                "meta": {
-                    "audio_name": audio_name,
-                    "run_id": run_id,
-                    "created_at": datetime.now(UTC).isoformat(),
-                    "model": DIARIZATION_MODEL,
-                },
-                "turns": diar_turns,
-                "whisper_segments_mapped": diar_items,
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
-            ok(f"Diarization JSON saved to: {diar_json_file}")
+            if saved_diarization is None:
+                diar_json_file.write_text(json.dumps({
+                    "meta": {
+                        "audio_name": audio_name,
+                        "run_id": run_id,
+                        "created_at": datetime.now(UTC).isoformat(),
+                        "model": DIARIZATION_MODEL,
+                    },
+                    "turns": diar_turns,
+                    "whisper_segments_mapped": diar_items,
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+                ok(f"Diarization JSON saved to: {diar_json_file}")
 
             save_diarized_txt(diar_items, out_dir / f"{audio_name}-{run_id}-diarized.txt")
             save_srt(diar_items, out_dir / f"{audio_name}-{run_id}-diarized.srt")
@@ -1231,10 +1347,11 @@ def main():
     for choice in choices:
         if choice.lower() != "mic":
             path = Path(choice) if Path(choice).is_absolute() else base_dir / choice
-            if not path.is_file():
+            if not path.is_file() and not (path.is_dir() and _run_identity(path)):
                 err(f"Audio file not found: {path}")
                 raise SystemExit(1)
-            if _has_processing_history(base_dir, path.name) and not _has_prior_outputs(base_dir, path.stem):
+            if path.is_file() and _has_processing_history(base_dir, path.name) and not _has_prior_outputs(base_dir,
+                                                                                                          path.stem):
                 warn(f"{path.name} was previously transcribed, but its outputs are missing; it will be rerun.")
 
     if len(choices) > 1:
