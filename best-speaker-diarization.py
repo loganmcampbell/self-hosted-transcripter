@@ -157,6 +157,7 @@ USE_TEMPERATURE_FALLBACK = True
 CONDITION_ON_PREVIOUS_TEXT = False
 # ------------------------------------
 PROCESSED_DB = ".processed.json"
+RUN_STATUS_SUFFIX = "-status.json"
 
 
 # -------- Helpers --------
@@ -223,6 +224,43 @@ def _valid_json(path: Path, required_key: str) -> dict | None:
     return payload if isinstance(payload, dict) and isinstance(payload.get(required_key), list) else None
 
 
+def _run_status_path(run_dir: Path, stem: str, run_id: str) -> Path:
+    return run_dir / f"{stem}-{run_id}{RUN_STATUS_SUFFIX}"
+
+
+def _load_run_status(run_dir: Path, stem: str, run_id: str) -> dict:
+    path = _run_status_path(run_dir, stem, run_id)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_run_status(
+        run_dir: Path,
+        stem: str,
+        run_id: str,
+        status: str,
+        *,
+        stage: str,
+        message: str | None = None,
+) -> None:
+    payload = {
+        "status": status,
+        "stage": stage,
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    if message:
+        payload["message"] = message
+    _run_status_path(run_dir, stem, run_id).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _find_resumable_runs(base_dir: Path) -> list[Path]:
     """Find interrupted runs that still contain their source media."""
     runs: list[Path] = []
@@ -257,8 +295,15 @@ def _find_resumable_runs(base_dir: Path) -> list[Path]:
             # always be reconstructed from it without running the model again.
             transcription_ok = _valid_json(transcript_json, "segments") is not None
             diarization_ok = _valid_json(diar_json, "turns") is not None
+            run_status = _load_run_status(run_dir, stem, run_id)
+            transcript_only_accepted = (
+                    run_status.get("status") == "complete"
+                    and run_status.get("stage") == "transcription_only"
+            )
             complete = transcription_ok and (
-                    not ENABLE_DIARIZATION or (diarization_ok and all(path.is_file() for path in expected[3:]))
+                    transcript_only_accepted
+                    or not ENABLE_DIARIZATION
+                    or (diarization_ok and all(path.is_file() for path in expected[3:]))
             )
             if source_files and not complete:
                 runs.append(run_dir)
@@ -896,17 +941,15 @@ def run_diarization(audio_path: str, pipeline) -> list[dict]:
     """Run diarization; return [{speaker, start, end}, ...] sorted by start."""
     if pipeline is None:
         return []
-    try:
-        with DiarizationProgressHook() as hook:
-            diarization = pipeline(audio_path, hook=hook)
-    except Exception as e:
-        err(f"Diarization failed: {e}")
-        return []
+    with DiarizationProgressHook() as hook:
+        diarization = pipeline(audio_path, hook=hook)
 
     turns = [
         {"speaker": str(speaker), "start": float(turn.start), "end": float(turn.end)}
         for turn, _, speaker in diarization.itertracks(yield_label=True)
     ]
+    if not turns:
+        raise RuntimeError("Diarization completed without returning any speaker turns.")
     turns.sort(key=lambda x: x["start"])
 
     speaker_map: dict[str, str] = {}
@@ -1022,6 +1065,44 @@ def _setup_logging(out_dir: Path, audio_name: str, run_id: str) -> logging.Logge
     return logging.getLogger("whisper")
 
 
+def _choose_resume_action(out_dir: Path, audio_name: str, run_id: str) -> str:
+    status = _load_run_status(out_dir, audio_name, run_id)
+    if status.get("status") == "failed":
+        warn(f"Previous {status.get('stage', 'processing')} attempt failed: {status.get('message', 'unknown error')}")
+    print(c("\nExisting transcript found. Choose how to continue:", Fore.CYAN + Style.BRIGHT))
+    print("  [1] Retry diarization only")
+    print("  [2] Rebuild transcription and diarization")
+    print("  [3] Accept transcript only (stop offering this run for retry)")
+    raw = input(c("Select action [1]: ", Fore.CYAN)).strip().lower()
+    return {
+        "": "retry_diarization",
+        "1": "retry_diarization",
+        "retry": "retry_diarization",
+        "2": "rebuild_all",
+        "rebuild": "rebuild_all",
+        "3": "accept_transcript",
+        "accept": "accept_transcript",
+    }.get(raw, "retry_diarization")
+
+
+def _remove_stage_artifacts(out_dir: Path, audio_name: str, run_id: str, include_transcript: bool) -> None:
+    names = [
+        f"{audio_name}-{run_id}-diarization.json",
+        f"{audio_name}-{run_id}-diarized.txt",
+        f"{audio_name}-{run_id}-diarized.srt",
+        f"{audio_name}-{run_id}-diarized.vtt",
+    ]
+    if include_transcript:
+        names.extend([
+            f"{audio_name}-{run_id}.json",
+            f"{audio_name}-{run_id}.txt",
+        ])
+    for name in names:
+        path = out_dir / name
+        if path.is_file():
+            path.unlink()
+
+
 def _select_audio(base_dir: Path, run_cleanup: bool = True) -> list[str]:
     """Prompt for one or more audio files, preferring unprocessed files."""
     candidates = _list_unprocessed_audio_candidates(base_dir, run_cleanup=run_cleanup)
@@ -1050,8 +1131,14 @@ def _select_audio(base_dir: Path, run_cleanup: bool = True) -> list[str]:
             return ["refresh"]
     for i, file in enumerate(pool, start=1):
         history_note = ""
-        if Path(file).is_dir() and _run_identity(Path(file)):
-            history_note = c("  [resume missing stages]", Fore.YELLOW)
+        identity = _run_identity(Path(file)) if Path(file).is_dir() else None
+        if identity:
+            stem, run_id = identity
+            status = _load_run_status(Path(file), stem, run_id)
+            if status.get("status") == "failed":
+                history_note = c(f"  [{status.get('stage', 'processing')} failed — action required]", Fore.RED)
+            else:
+                history_note = c("  [resume missing stages]", Fore.YELLOW)
         elif _has_processing_history(base_dir, file) and not _has_prior_outputs(base_dir, Path(file).stem):
             history_note = c("  [previously transcribed; outputs missing — rerun available]", Fore.YELLOW)
         print(f"  {c(f'[{i}]', Fore.MAGENTA)} {file}{history_note}")
@@ -1179,6 +1266,31 @@ def _process_choice(
     transcript_file = out_dir / f"{audio_name}-{run_id}.txt"
     json_file = out_dir / f"{audio_name}-{run_id}.json"
     saved_transcription = _valid_json(json_file, "segments")
+    if saved_transcription is not None and ENABLE_DIARIZATION:
+        diar_json_file = out_dir / f"{audio_name}-{run_id}-diarization.json"
+        if _valid_json(diar_json_file, "turns") is None:
+            resume_action = _choose_resume_action(out_dir, audio_name, run_id)
+            if resume_action == "accept_transcript":
+                _write_run_status(
+                    out_dir, audio_name, run_id, "complete",
+                    stage="transcription_only",
+                    message="User accepted the transcript without diarization.",
+                )
+                logger.info("Run accepted as transcription-only; diarization will not be retried")
+                ok("Transcript accepted. This run will no longer be offered for diarization retry.")
+                return {
+                    "name": audio_name,
+                    "transcription_seconds": 0.0,
+                    "diarization_seconds": 0.0,
+                    "total_seconds": time.perf_counter() - t_total,
+                }
+            if resume_action == "rebuild_all":
+                _remove_stage_artifacts(out_dir, audio_name, run_id, include_transcript=True)
+                saved_transcription = None
+                logger.info("User requested full transcription and diarization rebuild")
+            else:
+                _remove_stage_artifacts(out_dir, audio_name, run_id, include_transcript=False)
+                logger.info("User requested diarization-only retry")
     if saved_transcription is not None:
         banner("Transcription Already Complete", Fore.GREEN)
         result = saved_transcription
@@ -1229,7 +1341,7 @@ def _process_choice(
                 "model": MODEL_NAME,
                 "device": device_type,
                 "fp16": fp16,
-                "duration_seconds": float(dt),
+                "transcription_runtime_seconds": float(dt),
                 "whisper_params": {
                     "language_forced": FORCE_LANGUAGE,
                     "sentence_split": USE_SENTENCE_SPLIT,
@@ -1268,10 +1380,23 @@ def _process_choice(
         else:
             banner("Diarization", Fore.GREEN)
             t_diar = time.perf_counter()
-            diar_turns = run_diarization(audio_path, diarization_pipeline)
-            dt_diar = time.perf_counter() - t_diar
-            logger.info("Diarization finished in %s", _fmt_duration(dt_diar))
-            ok(f"Diarization done in {_fmt_duration(dt_diar)}")
+            _write_run_status(out_dir, audio_name, run_id, "running", stage="diarization")
+            try:
+                diar_turns = run_diarization(audio_path, diarization_pipeline)
+            except Exception as exc:
+                dt_diar = time.perf_counter() - t_diar
+                logger.exception("Diarization failed after %s", _fmt_duration(dt_diar))
+                _write_run_status(
+                    out_dir, audio_name, run_id, "failed",
+                    stage="diarization",
+                    message=f"{type(exc).__name__}: {exc}",
+                )
+                err(f"Diarization failed: {type(exc).__name__}: {exc}")
+                warn("The transcript was preserved. Select this run again to retry, rebuild, or accept transcript-only.")
+            else:
+                dt_diar = time.perf_counter() - t_diar
+                logger.info("Diarization succeeded with %d turns in %s", len(diar_turns), _fmt_duration(dt_diar))
+                ok(f"Diarization done in {_fmt_duration(dt_diar)} ({len(diar_turns)} speaker turns)")
         if diar_turns:
             diar_items = map_segments_to_speakers(segments, diar_turns)
             if saved_diarization is None:
@@ -1290,6 +1415,7 @@ def _process_choice(
             save_diarized_txt(diar_items, out_dir / f"{audio_name}-{run_id}-diarized.txt")
             save_srt(diar_items, out_dir / f"{audio_name}-{run_id}-diarized.srt")
             save_vtt(diar_items, out_dir / f"{audio_name}-{run_id}-diarized.vtt")
+            _write_run_status(out_dir, audio_name, run_id, "complete", stage="diarization")
             ok(f"Diarized TXT/SRT/VTT saved to: {out_dir}")
         else:
             warn("Diarization skipped or returned no turns.")
