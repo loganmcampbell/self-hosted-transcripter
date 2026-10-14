@@ -878,6 +878,14 @@ class DiarizationProgressHook:
         bar.refresh()
 
 
+# TODO: Speaker identification — label a diarized cluster as a known person (e.g. "Logan")
+# instead of generic SPEAKER_00/01/etc. Plan: record a short reference clip of the target
+# voice, extract speaker embeddings per turn/cluster (pyannote/embedding or
+# speechbrain/spkrec-ecapa-voxceleb), cosine-compare each cluster's average embedding
+# against the reference, and relabel the best match above a similarity threshold. Slots in
+# after run_diarization() and before map_segments_to_speakers() via a speaker_map override.
+
+
 # -------- Diarization utils --------
 def _load_diarization_pipeline():
     if not ENABLE_DIARIZATION:
